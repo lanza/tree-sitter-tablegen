@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test Parser
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate parser
+        run: npx tree-sitter generate
+
+      - name: Build parser
+        run: npx tree-sitter build --wasm
+
+      - name: Run tests
+        run: npx tree-sitter test
+
+      - name: Parse examples
+        run: npx tree-sitter parse examples/*.td --quiet --stat
+
+  test-bindings:
+    name: Test Language Bindings
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        binding: [node, python, rust, go]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        if: matrix.binding == 'node'
+
+      - name: Test Node.js binding
+        if: matrix.binding == 'node'
+        run: |
+          npm install
+          node -e "const parser = require('.'); console.log('Node.js binding loaded successfully');"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+        if: matrix.binding == 'python'
+
+      - name: Test Python binding
+        if: matrix.binding == 'python'
+        run: |
+          pip install setuptools wheel
+          python setup.py build
+          python -c "import tree_sitter_tablegen; print('Python binding loaded successfully')"
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: matrix.binding == 'rust'
+
+      - name: Test Rust binding
+        if: matrix.binding == 'rust'
+        run: |
+          cd bindings/rust
+          cargo build --release
+          cargo test
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+        if: matrix.binding == 'go'
+
+      - name: Test Go binding
+        if: matrix.binding == 'go'
+        run: |
+          cd bindings/go
+          go test -v
+
+  validate-queries:
+    name: Validate Query Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate parser
+        run: npx tree-sitter generate
+
+      - name: Build parser
+        run: npx tree-sitter build --wasm
+
+      - name: Validate highlights query
+        run: npx tree-sitter query queries/highlights.scm examples/registers.td > /dev/null
+
+      - name: Validate tags query
+        run: npx tree-sitter query queries/tags.scm examples/instructions.td > /dev/null
+
+      - name: Validate locals query
+        run: npx tree-sitter query queries/locals.scm examples/control_flow.td > /dev/null
+
+      - name: Test syntax highlighting
+        run: npx tree-sitter highlight examples/*.td > /dev/null
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Check grammar.js syntax
+        run: node -c grammar.js
+
+      - name: Check for parser conflicts
+        run: |
+          npx tree-sitter generate 2>&1 | tee generate.log
+          if grep -i "conflict" generate.log; then
+            echo "Parser has conflicts!"
+            exit 1
+          fi
+
+  check-parser-size:
+    name: Check Parser Size
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate parser
+        run: npx tree-sitter generate
+
+      - name: Check parser.c size
+        run: |
+          SIZE=$(wc -c < src/parser.c)
+          echo "Parser size: $SIZE bytes"
+          # Warn if parser is larger than 5MB
+          if [ $SIZE -gt 5242880 ]; then
+            echo "::warning::Parser size is larger than 5MB"
+          fi
+
+  coverage:
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate parser
+        run: npx tree-sitter generate
+
+      - name: Build parser
+        run: npx tree-sitter build --wasm
+
+      - name: Run tests with statistics
+        run: npx tree-sitter test --stat
+
+      - name: Parse all examples
+        run: |
+          for file in examples/*.td test/corpus/*.td; do
+            echo "Parsing $file..."
+            npx tree-sitter parse "$file" --quiet || exit 1
+          done

@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.2.3)'
+        required: true
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          # Extract the section for this version from CHANGELOG.md
+          sed -n "/## \[${VERSION}\]/,/## \[/p" CHANGELOG.md | sed '$ d' > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          release_name: Release v${{ steps.get_version.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+
+  build-wasm:
+    name: Build WASM
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build WASM
+        run: npx tree-sitter build --wasm
+
+      - name: Upload WASM artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./tree-sitter-tablegen.wasm
+          asset_name: tree-sitter-tablegen.wasm
+          asset_content_type: application/wasm
+
+  publish-npm:
+    name: Publish to npm
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Update package version
+        run: npm version ${{ needs.create-release.outputs.version }} --no-git-tag-version
+
+      - name: Publish to npm
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        if: secrets.NPM_TOKEN != ''
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Update Cargo.toml version
+        run: |
+          cd bindings/rust
+          sed -i 's/^version = .*/version = "${{ needs.create-release.outputs.version }}"/' Cargo.toml
+
+      - name: Publish to crates.io
+        run: |
+          cd bindings/rust
+          cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        if: secrets.CARGO_TOKEN != ''
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine setuptools wheel
+
+      - name: Update version in pyproject.toml
+        run: |
+          sed -i 's/^version = .*/version = "${{ needs.create-release.outputs.version }}"/' pyproject.toml
+
+      - name: Build distribution
+        run: python -m build
+
+      - name: Publish to PyPI
+        run: python -m twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        if: secrets.PYPI_TOKEN != ''
+
+  test-release:
+    name: Test Release
+    needs: [publish-npm, publish-crates, publish-pypi]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Test npm package
+        run: |
+          sleep 60  # Wait for package to propagate
+          npm install tree-sitter-tablegen
+          node -e "const parser = require('tree-sitter-tablegen'); console.log('npm package works!');"
+        continue-on-error: true
+
+      - name: Test PyPI package
+        run: |
+          sleep 60  # Wait for package to propagate
+          pip install tree-sitter-tablegen
+          python -c "import tree_sitter_tablegen; print('PyPI package works!')"
+        continue-on-error: true
+
+      - name: Test crates.io package
+        run: |
+          sleep 60  # Wait for package to propagate
+          cargo new test-project
+          cd test-project
+          cargo add tree-sitter-tablegen
+          echo 'fn main() { println!("crates.io package works!"); }' > src/main.rs
+          cargo build
+        continue-on-error: true
